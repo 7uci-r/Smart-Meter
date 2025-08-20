@@ -1,0 +1,140 @@
+Quick verification (one-time)
+
+Open PowerShell and run:
+
+node -v
+npm -v
+
+
+If these show versions, Node/npm are installed. If not, install Node.js from nodejs.org (LTS).
+
+Terminal A — Start the backend (Node server that reads COM3)
+
+Open a PowerShell window.
+
+Change to backend folder:
+
+cd D:\smart-meter-dashboard\backend
+
+
+(If you didn’t install deps yet or switched machines) install:
+
+npm install
+
+
+Set environment variables for COM port and baud, then start server:
+
+$env:SERIAL_PORT = "COM3"
+$env:SERIAL_BAUD = "115200"
+npm start
+
+
+You can also run with nodemon for auto-reload:
+
+npx nodemon server.js
+
+
+What to expect in this terminal
+
+A startup line: server http://localhost:8000 serial:COM3@115200
+
+serial open COM3 115200 (or an error if COM3 is busy)
+
+Lines like: [serial raw] ... and [parsed] { timestamp: '...', voltage: 228.6, ... }
+
+If you don’t see serial open:
+
+Close PuTTY (or any serial monitor) — only one app can open COM3.
+
+If still failing, unplug/replug USB-serial, check Device Manager → Ports to confirm COM3.
+
+To test backend quickly (while backend running), open a new PowerShell or use same and run:
+
+curl http://localhost:8000/api/health
+curl http://localhost:8000/api/meters/1/readings?limit=5
+
+
+You should get JSON back (or an empty array if no readings yet).
+
+Terminal B — Start the frontend (Vite + React)
+
+Open a second PowerShell window.
+
+Change to frontend folder:
+
+cd D:\smart-meter-dashboard\frontend
+
+
+Install dependencies (if you haven’t already):
+
+npm install
+
+
+If npm run dev previously complained 'vite' is not recognized, use the project-local Vite invocation (this avoids global vite requirement):
+
+npm run dev
+# if that still errors, try:
+npx vite
+# or
+npm exec -- vite
+
+
+After successful start you’ll see something like:
+
+  Local: http://localhost:5173/
+
+
+Open that URL in your browser.
+
+If you have an .env file to override API base, ensure it contains:
+
+VITE_API_BASE=http://localhost:8000
+
+
+If you create/modify .env, restart the Vite dev server.
+
+Where to look for output / verification
+
+Backend terminal — serial raw & parsed logs. If parsing succeeds you’ll see [parsed] { timestamp:..., voltage: ..., frequency: ... }.
+
+Quick API test:
+
+http://localhost:8000/api/health → JSON status.
+
+http://localhost:8000/api/meters/1/readings?limit=10 → JSON list (open in browser or curl).
+
+Frontend — open http://localhost:5173 in browser.
+
+Browser DevTools → Console: show runtime errors.
+
+DevTools → Network: inspect calls to /api/meters/1/readings.
+
+Chart and cards should update every poll (default 5s).
+
+Common issues & one-line fixes
+
+vite not recognized → run npm install inside frontend then npm run dev or use npx vite.
+
+COM3 busy → close PuTTY / any serial monitor or unplug/replug adapter. Then restart backend.
+
+Backend crashed on start → paste the backend console error here.
+
+Frontend shows empty chart → check Network tab for the /readings request and paste response here.
+
+CORS error → backend uses cors() so unlikely, but paste browser console error if it appears.
+
+If it still doesn’t show — paste these 3 outputs here
+
+The last 30 lines from the backend terminal after npm start.
+
+The output of:
+
+curl http://localhost:8000/api/health
+
+
+The output of:
+
+curl http://localhost:8000/api/meters/1/readings?limit=5
+
+
+I’ll read them and tell you the exact single-line change (or missing install) to fix it.
