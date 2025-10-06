@@ -1,0 +1,805 @@
+/* main.c
+ *
+ * Single-phase focused Modbus poller for Enersol MFR series (minimal prints)
+ * with PCA (6 variables) + FFT-based spectral sparsification (quantized int16).
+ *
+ * Keep this file as a single copy-paste replacement for your existing main.c.
+ */
+
+#include "main.h"
+#include "usart.h"
+#include "usb_otg.h"
+#include "gpio.h"
+#include "fft_analysis.h"
+
+#include <stdint.h>
+#include <stdio.h>
+#include <string.h>
+#include <math.h>
+#include <stdlib.h>
+
+/* Use your existing UART handles from CubeMX-generated usart.c */
+extern UART_HandleTypeDef huart2; /* Modbus (USART2) */
+extern UART_HandleTypeDef huart3; /* Debug (USART3) */
+
+/* Route printf to huart3 (debug) */
+#ifdef __GNUC__
+  #define PUTCHAR_PROTOTYPE int __io_putchar(int ch)
+#else
+  #define PUTCHAR_PROTOTYPE int fputc(int ch, FILE *f)
+#endif
+PUTCHAR_PROTOTYPE {
+    HAL_UART_Transmit(&huart3, (uint8_t *)&ch, 1, HAL_MAX_DELAY);
+    return ch;
+}
+
+/* Prototypes */
+void SystemClock_Config(void);
+void Error_Handler(void);
+
+/* RS485 DE pin */
+#define RS485_DE_PORT  GPIOA
+#define RS485_DE_PIN   GPIO_PIN_4
+
+/* Modbus settings */
+#define MODBUS_SLAVE_ID  1
+
+/* Sweep delay between overall sweeps (ms) */
+#define SWEEP_DELAY_MS 2000U
+
+/* PCA batch size and dims */
+#define BATCH_M 60
+
+/* ----- IMPORTANT: change N_VARS to include new power-related series -----
+   Variables (order used everywhere):
+     0: Current (A)         reg 3852
+     1: Voltage (V)         reg 3866
+     2: Frequency (Hz)      reg 3854
+     3: Apparent power (VA) reg 3840
+     4: Active power (W)    reg 3842
+     5: Power factor        reg 3846
+*/
+#define N_VARS 6
+
+/* Choose how many principal components to keep when reporting/compressing */
+#define KEEP_K 1 /* implemented via power-iteration for top-1 */
+
+/* Register IDs used for sampling */
+#define REG_CURRENT 3852
+#define REG_VOLTAGE 3866
+#define REG_FREQ    3854
+#define REG_APPARENT 3840
+#define REG_ACTIVE   3842
+#define REG_PF       3846
+
+/* CRC16 (Modbus) */
+static uint16_t Modbus_CRC16(const uint8_t *buf, uint16_t len) {
+    uint16_t crc = 0xFFFF;
+    for (uint16_t pos = 0; pos < len; pos++) {
+        crc ^= (uint16_t)buf[pos];
+        for (uint8_t i = 8; i != 0; i--) {
+            if ((crc & 0x0001) != 0) {
+                crc >>= 1;
+                crc ^= 0xA001;
+            } else {
+                crc >>= 1;
+            }
+        }
+    }
+    return crc;
+}
+
+/* Print hex buffer on debug UART */
+static void print_hex_buf(const uint8_t *buf, uint16_t len) {
+    for (uint16_t i = 0; i < len; ++i) printf("%02X ", buf[i]);
+    printf("\r\n");
+}
+
+/* low-level: send a Modbus request (function 0x03 or 0x04), read response (blocking)
+   returns 0 on success and places 'byteCount' payload into payload and sets *payload_len */
+static int modbus_txrx(uint8_t slaveID, uint8_t functionCode, uint16_t startAddr, uint16_t numRegs,
+                       uint8_t *payload, uint16_t *payload_len)
+{
+    uint8_t tx[8];
+    tx[0] = slaveID;
+    tx[1] = functionCode;
+    tx[2] = (uint8_t)(startAddr >> 8);
+    tx[3] = (uint8_t)(startAddr & 0xFF);
+    tx[4] = (uint8_t)(numRegs >> 8);
+    tx[5] = (uint8_t)(numRegs & 0xFF);
+    uint16_t crc = Modbus_CRC16(tx, 6);
+    tx[6] = crc & 0xFF;
+    tx[7] = (crc >> 8) & 0xFF;
+
+    /* Set DE = TX */
+    HAL_GPIO_WritePin(RS485_DE_PORT, RS485_DE_PIN, GPIO_PIN_SET);
+    HAL_Delay(1);
+
+    if (HAL_UART_Transmit(&huart2, tx, 8, HAL_MAX_DELAY) != HAL_OK) {
+        HAL_GPIO_WritePin(RS485_DE_PORT, RS485_DE_PIN, GPIO_PIN_RESET);
+        return -1;
+    }
+
+    HAL_Delay(2);
+    HAL_GPIO_WritePin(RS485_DE_PORT, RS485_DE_PIN, GPIO_PIN_RESET);
+
+    /* read first 3 bytes of response (addr, func, bytecount) */
+    uint8_t hdr[3];
+    if (HAL_UART_Receive(&huart2, hdr, 3, 500) != HAL_OK) return -2;
+    uint8_t byteCount = hdr[2];
+    uint16_t remaining = (uint16_t)byteCount + 2; /* data + CRC */
+    uint16_t total = 3 + remaining;
+    if (total > 128) return -3;
+
+    uint8_t rx[128];
+    rx[0] = hdr[0]; rx[1] = hdr[1]; rx[2] = hdr[2];
+    if (HAL_UART_Receive(&huart2, &rx[3], remaining, 500) != HAL_OK) return -4;
+
+    /* Verify CRC */
+    uint16_t rxCrc = (uint16_t)rx[total-2] | ((uint16_t)rx[total-1] << 8);
+    uint16_t calc = Modbus_CRC16(rx, total - 2);
+    if (rxCrc != calc) {
+        printf("CRC mismatch (calc %04X rx %04X)\r\n", calc, rxCrc);
+        return -5;
+    }
+
+    /* Print the raw frame for trace (kept for debugging) */
+    printf("RAW RX (slave%u reg%u func%02X): ", (unsigned)slaveID, (unsigned)startAddr, (unsigned)functionCode);
+    print_hex_buf(rx, total);
+
+    /* copy payload bytes (data only) */
+    if (payload && payload_len) {
+        if (byteCount > *payload_len) return -6;
+        memcpy(payload, &rx[3], byteCount);
+        *payload_len = byteCount;
+    }
+    return 0;
+}
+
+/* wrapper: try function 0x03 first, then 0x04 */
+static int modbus_read_try03_04(uint8_t slaveID, uint16_t startAddr, uint16_t numRegs,
+                                uint8_t *payload, uint16_t *payload_len)
+{
+    uint16_t len = *payload_len;
+    int rc = modbus_txrx(slaveID, 0x03, startAddr, numRegs, payload, &len);
+    if (rc == 0) { *payload_len = len; return 0; }
+    len = *payload_len;
+    rc = modbus_txrx(slaveID, 0x04, startAddr, numRegs, payload, &len);
+    if (rc == 0) { *payload_len = len; return 0; }
+    return rc;
+}
+
+/* Interpret two 16-bit regs (big-endian words) as word-swapped 32-bit float and uint32 */
+static void regs_to_swapped_float_u32(const uint8_t *payload, float *out_f, uint32_t *out_u32)
+{
+    uint16_t regHi = (uint16_t)payload[0] << 8 | payload[1];
+    uint16_t regLo = (uint16_t)payload[2] << 8 | payload[3];
+    uint32_t swapped = ((uint32_t)regLo << 16) | regHi;
+    if (out_u32) *out_u32 = swapped;
+    if (out_f) {
+        float f; memcpy(&f, &swapped, sizeof(f)); *out_f = f;
+    }
+}
+
+/* DEBUG helper: read two regs and print many possible interpretations */
+static int debug_read_reg_interpret(uint16_t reg)
+{
+    uint8_t payload[8];
+    uint16_t payload_len = sizeof(payload);
+    int rc = modbus_read_try03_04(MODBUS_SLAVE_ID, reg, 2, payload, &payload_len);
+    if (rc != 0) {
+        printf("debug_read_reg_interpret: read failed rc=%d for reg %u\r\n", rc, (unsigned)reg);
+        return rc;
+    }
+
+    /* print raw payload bytes */
+    printf("DEBUG RAW payload (reg %u): ", (unsigned)reg);
+    for (uint16_t i = 0; i < payload_len; ++i) printf("%02X ", payload[i]);
+    printf("\r\n");
+
+    /* two 16-bit words as read (big-endian words) */
+    uint16_t w0 = (uint16_t)payload[0] << 8 | payload[1];
+    uint16_t w1 = (uint16_t)payload[2] << 8 | payload[3];
+    printf(" Words (big-endian words): w0=0x%04X  w1=0x%04X\r\n", (unsigned)w0, (unsigned)w1);
+
+    uint32_t swapped = ((uint32_t)w1 << 16) | (uint32_t)w0;
+    float f_swapped; memcpy(&f_swapped, &swapped, sizeof(f_swapped));
+    printf(" Word-swapped float (swapped=0x%08lX): %f\r\n", (unsigned long)swapped, (double)f_swapped);
+
+    uint32_t noswap = ((uint32_t)w0 << 16) | (uint32_t)w1;
+    float f_noswap; memcpy(&f_noswap, &noswap, sizeof(f_noswap));
+    printf(" No-word-swap float (noswap=0x%08lX): %f\r\n", (unsigned long)noswap, (double)f_noswap);
+
+    uint32_t u_be = noswap;
+    printf(" uint32 BE (w0<<16|w1): 0x%08lX (%lu)\r\n", (unsigned long)u_be, (unsigned long)u_be);
+
+    uint32_t u_le = (uint32_t)payload[3] << 24 | (uint32_t)payload[2] << 16 | (uint32_t)payload[1] << 8 | (uint32_t)payload[0];
+    printf(" uint32 LE (bytes reversed): 0x%08lX (%lu)\r\n", (unsigned long)u_le, (unsigned long)u_le);
+
+    int32_t si_be = (int32_t)u_be;
+    int32_t si_le = (int32_t)u_le;
+    printf(" int32 BE: %ld  int32 LE: %ld\r\n", (long)si_be, (long)si_le);
+
+    int all_zero = 1;
+    for (uint16_t i = 0; i < payload_len; ++i) if (payload[i] != 0) { all_zero = 0; break; }
+    if (all_zero) printf(" DEBUG NOTE: payload all zero bytes -> meter reported 0 for this register.\r\n");
+
+    return 0;
+}
+
+/* Read 2 regs and return swapped float/u32 (0 on success) */
+static int read_pair_ws(uint16_t reg, float *out_f, uint32_t *out_u32)
+{
+    uint8_t payload[8]; uint16_t payload_len = sizeof(payload);
+    int rc = modbus_read_try03_04(MODBUS_SLAVE_ID, reg, 2, payload, &payload_len);
+    if (rc != 0) return rc;
+    if (payload_len < 4) return -2;
+    regs_to_swapped_float_u32(payload, out_f, out_u32);
+    return 0;
+}
+
+/* verbose read helper for power registers */
+static int read_pair_ws_verbose(uint16_t reg, float *out_f, uint32_t *out_u32)
+{
+    uint8_t payload[8];
+    uint16_t payload_len;
+    int rc;
+
+    /* Try function 0x03 explicitly first */
+    payload_len = sizeof(payload);
+    rc = modbus_txrx(MODBUS_SLAVE_ID, 0x03, reg, 2, payload, &payload_len);
+    if (rc == 0 && payload_len >= 4) {
+        float f; uint32_t u;
+        regs_to_swapped_float_u32(payload, &f, &u);
+        printf("  (Try func03) -> float=%f  u32=0x%08lX\r\n", (double)f, (unsigned long)u);
+        if (out_f) *out_f = f;
+        if (out_u32) *out_u32 = u;
+        return 0;
+    }
+
+    /* If func03 failed or returned 0-length, try func04 explicitly */
+    payload_len = sizeof(payload);
+    rc = modbus_txrx(MODBUS_SLAVE_ID, 0x04, reg, 2, payload, &payload_len);
+    if (rc == 0 && payload_len >= 4) {
+        float f; uint32_t u;
+        regs_to_swapped_float_u32(payload, &f, &u);
+        printf("  (Try func04) -> float=%f  u32=0x%08lX\r\n", (double)f, (unsigned long)u);
+        if (out_f) *out_f = f;
+        if (out_u32) *out_u32 = u;
+        return 0;
+    }
+
+    return rc;
+}
+
+/* ---------------- PCA helpers generalized for N_VARS (here N_VARS==6) ---------------- */
+
+/* Compute column means for an m×n matrix */
+static void compute_means_generic(const float data[BATCH_M][N_VARS], size_t m, float mean[N_VARS]) {
+    for (size_t j = 0; j < N_VARS; ++j) mean[j] = 0.0f;
+    for (size_t i = 0; i < m; ++i)
+        for (size_t j = 0; j < N_VARS; ++j)
+            mean[j] += data[i][j];
+    for (size_t j = 0; j < N_VARS; ++j) mean[j] /= (float)m;
+}
+
+/* Compute symmetric n x n sample covariance: C = (1/(m-1)) X^T X (X is already centered) */
+static void compute_covariance_NxN(const float data[BATCH_M][N_VARS], size_t m, float C[N_VARS][N_VARS]) {
+    for (size_t i = 0; i < N_VARS; ++i) for (size_t j = 0; j < N_VARS; ++j) C[i][j] = 0.0f;
+    for (size_t r = 0; r < m; ++r) {
+        for (size_t i = 0; i < N_VARS; ++i)
+            for (size_t j = 0; j < N_VARS; ++j)
+                C[i][j] += data[r][i] * data[r][j];
+    }
+    float scale = 1.0f / (float)(m - 1);
+    for (size_t i = 0; i < N_VARS; ++i)
+        for (size_t j = 0; j < N_VARS; ++j)
+            C[i][j] *= scale;
+}
+
+/* Power iteration to compute top-1 eigenvector/eigenvalue of symmetric NxN matrix.
+   Returns eigenvalue in *lambda and eigenvector in vec_out (length N_VARS). */
+static void power_iteration_top1(const float C[N_VARS][N_VARS], float vec_out[N_VARS], float *lambda_out) {
+    /* initialize vector to small random / ones */
+    float v[N_VARS];
+    for (size_t i = 0; i < N_VARS; ++i) v[i] = 1.0f;
+
+    /* normalize initial */
+    float norm = 0.0f;
+    for (size_t i = 0; i < N_VARS; ++i) norm += v[i]*v[i];
+    norm = sqrtf(norm);
+    if (norm == 0.0f) norm = 1.0f;
+    for (size_t i = 0; i < N_VARS; ++i) v[i] /= norm;
+
+    const int MAX_IT = 200;
+    const float TOL = 1e-6f;
+    float w[N_VARS];
+    float lambda = 0.0f;
+
+    for (int it = 0; it < MAX_IT; ++it) {
+        /* w = C * v */
+        for (size_t i = 0; i < N_VARS; ++i) {
+            float acc = 0.0f;
+            for (size_t j = 0; j < N_VARS; ++j) acc += C[i][j] * v[j];
+            w[i] = acc;
+        }
+        /* compute norm of w */
+        float wnorm = 0.0f;
+        for (size_t i = 0; i < N_VARS; ++i) wnorm += w[i]*w[i];
+        wnorm = sqrtf(wnorm);
+        if (wnorm == 0.0f) { /* zero matrix? */
+            lambda = 0.0f;
+            break;
+        }
+        /* normalize w to become new v */
+        for (size_t i = 0; i < N_VARS; ++i) v[i] = w[i] / wnorm;
+
+        /* Rayleigh quotient (approx eigenvalue) */
+        float num = 0.0f, den = 0.0f;
+        for (size_t i = 0; i < N_VARS; ++i) {
+            float Cv_i = 0.0f;
+            for (size_t j = 0; j < N_VARS; ++j) Cv_i += C[i][j] * v[j];
+            num += v[i] * Cv_i;
+            den += v[i]*v[i];
+        }
+        float lambda_new = (den != 0.0f) ? (num / den) : 0.0f;
+
+        if (fabsf(lambda_new - lambda) < TOL) { lambda = lambda_new; break; }
+        lambda = lambda_new;
+    }
+
+    /* copy out */
+    for (size_t i = 0; i < N_VARS; ++i) vec_out[i] = v[i];
+    if (lambda_out) *lambda_out = lambda;
+}
+
+/* Project centered data (m×n) onto first eigenvector v (result m×1 -> Y) */
+static void project_to_top1(const float data[BATCH_M][N_VARS], size_t m, const float v[N_VARS], float Y[BATCH_M][1]) {
+    for (size_t i = 0; i < m; ++i) {
+        float acc = 0.0f;
+        for (size_t j = 0; j < N_VARS; ++j) acc += data[i][j] * v[j];
+        Y[i][0] = acc;
+    }
+}
+
+/* Reconstruct: Xhat = Y * v^T + mean  (Y is m×1, v is length N_VARS) */
+static void reconstruct_from_top1(const float Y[BATCH_M][1], size_t m, const float v[N_VARS], const float mean[N_VARS], float Xhat[BATCH_M][N_VARS]) {
+    for (size_t i = 0; i < m; ++i) {
+        for (size_t j = 0; j < N_VARS; ++j) {
+            Xhat[i][j] = Y[i][0] * v[j] + mean[j];
+        }
+    }
+}
+
+/* Compute MSE across all entries between data(m×n) and Xhat(m×n) */
+static float compute_mse_generic(const float data[BATCH_M][N_VARS], const float Xhat[BATCH_M][N_VARS], size_t m) {
+    double s = 0.0;
+    for (size_t i = 0; i < m; ++i)
+        for (size_t j = 0; j < N_VARS; ++j) {
+            double e = (double)data[i][j] - (double)Xhat[i][j];
+            s += e*e;
+        }
+    return (float)(s / (double)(m * N_VARS));
+}
+
+/* ---------------- small helpers for FFT-based sparsification ---------------- */
+typedef struct { uint16_t idx; float energy; } bin_e_t;
+static int cmp_bin_e_desc(const void *a, const void *b) {
+    float ea = ((const bin_e_t*)a)->energy;
+    float eb = ((const bin_e_t*)b)->energy;
+    if (ea < eb) return 1;
+    if (ea > eb) return -1;
+    return 0;
+}
+
+/* ---------------- PCA run: collect 60 samples, compute PCA (top-1), print results ---------------- */
+static void run_pca_batch(void) {
+    static float raw[BATCH_M][N_VARS]; /* order: cur, volt, freq, apparent, active, pf */
+    float mean[N_VARS];
+    float cov[N_VARS][N_VARS];
+    float topvec[N_VARS];
+    float topeig;
+    float Y_k1[BATCH_M][1];
+    float Xhat[BATCH_M][N_VARS];
+
+    printf("\r\n--- Starting 60-s PCA batch collection ---\r\n");
+
+    float last_good[N_VARS] = {10.0f, 230.0f, 50.0f, 0.0f, 0.0f, 1.0f};
+    for (size_t i = 0; i < BATCH_M; ++i) {
+        float cur = 0.0f, volt = 0.0f, freq = 0.0f;
+        float app = 0.0f, act = 0.0f, pf = 0.0f;
+        uint32_t u;
+        int ok1 = (read_pair_ws(REG_CURRENT, &cur, &u) == 0);
+        int ok2 = (read_pair_ws(REG_VOLTAGE, &volt, &u) == 0);
+        int ok3 = (read_pair_ws(REG_FREQ, &freq, &u) == 0);
+        int ok4 = (read_pair_ws(REG_APPARENT, &app, &u) == 0);
+        int ok5 = (read_pair_ws(REG_ACTIVE, &act, &u) == 0);
+        int ok6 = (read_pair_ws(REG_PF, &pf, &u) == 0);
+
+        if (!ok1) cur = last_good[0]; else last_good[0] = cur;
+        if (!ok2) volt = last_good[1]; else last_good[1] = volt;
+        if (!ok3) freq = last_good[2]; else last_good[2] = freq;
+        if (!ok4) app = last_good[3]; else last_good[3] = app;
+        if (!ok5) act = last_good[4]; else last_good[4] = act;
+        if (!ok6) pf  = last_good[5]; else last_good[5] = pf;
+
+        raw[i][0] = cur; raw[i][1] = volt; raw[i][2] = freq;
+        raw[i][3] = app; raw[i][4] = act; raw[i][5] = pf;
+
+        printf("[%02u] C=%6.3f A  V=%7.3f V  F=%6.3f Hz  App=%8.3f VA  Act=%8.3f W  PF=%5.3f\r\n",
+               (unsigned)i+1, (double)cur, (double)volt, (double)freq, (double)app, (double)act, (double)pf);
+
+        /* wait approximately 1 second between samples */
+        HAL_Delay(1000);
+    }
+
+    /* Compute means */
+    compute_means_generic(raw, BATCH_M, mean);
+    printf("Batch means: Current=%6.3f A  Voltage=%7.3f V  Freq=%6.3f Hz  App=%8.3f VA  Act=%8.3f W  PF=%5.3f\r\n",
+           (double)mean[0], (double)mean[1], (double)mean[2], (double)mean[3], (double)mean[4], (double)mean[5]);
+
+    /* center data in-place (store in centered) */
+    static float centered[BATCH_M][N_VARS];
+    for (size_t i = 0; i < BATCH_M; ++i)
+        for (size_t j = 0; j < N_VARS; ++j)
+            centered[i][j] = raw[i][j] - mean[j];
+
+    /* covariance */
+    compute_covariance_NxN(centered, BATCH_M, cov);
+    printf("Covariance matrix (%u x %u):\r\n", (unsigned)N_VARS, (unsigned)N_VARS);
+    for (size_t i = 0; i < N_VARS; ++i) {
+        printf("  ");
+        for (size_t j = 0; j < N_VARS; ++j) printf("%10.6f  ", (double)cov[i][j]);
+        printf("\r\n");
+    }
+
+    /* power-iteration to get top eigenvector/eigenvalue */
+    float tomega = 0.0f;
+    power_iteration_top1(cov, topvec, &tomega);
+    /* above line is ugly; replace with two-step to be clear */
+    /* re-run cleanly: */
+    power_iteration_top1(cov, topvec, &tomega);
+    topeig = tomega;
+
+    /* explained variance ratios (approximate: lambda_i / trace) */
+    double trace = 0.0;
+    for (size_t i = 0; i < N_VARS; ++i) trace += cov[i][i];
+    printf("Top eigenvalue (approx): %10.6f    Trace: %10.6f\r\n", (double)tomega, (double)trace);
+    /* above assignment was for clarity - replace: */
+    /* but to avoid confusion, reset: */
+    float eigval_top = topeig;
+    printf("Top eigenvalue (approx): %10.6f  Explained ratio (top/trace): %6.3f\r\n",
+           (double)eigval_top, (trace > 0.0 ? (double)(eigval_top / trace) : 0.0));
+
+    /* Project to top-1 */
+    project_to_top1(centered, BATCH_M, topvec, Y_k1);
+
+    /* Reconstruct from k=1 */
+    reconstruct_from_top1(Y_k1, BATCH_M, topvec, mean, Xhat);
+
+    /* Compute MSE */
+    float mse = compute_mse_generic(raw, Xhat, BATCH_M);
+    printf("Reconstruction MSE (k=%d): %g\r\n", KEEP_K, (double)mse);
+
+    /* Show savings estimate */
+    size_t raw_bytes = BATCH_M * N_VARS * sizeof(float);
+    size_t compressed_bytes = BATCH_M * KEEP_K * sizeof(float) + N_VARS * sizeof(float); /* means + coeffs */
+    double saved = 100.0 * (1.0 - ((double)compressed_bytes / (double)raw_bytes));
+    printf("Raw bytes per batch: %u  Compressed bytes (per-batch, w/o eigenvecs): %u  Savings: %5.2f%%\r\n",
+           (unsigned)raw_bytes, (unsigned)compressed_bytes, saved);
+
+    /* Print a small table: first 10 rows original vs reconstructed */
+    printf("\r\nSample |  Cur(A) |  Volt(V) | Freq(Hz) | Appar(VA) | Active(W) | PF  ||  Curr_hat Volt_hat Freq_hat App_hat Act_hat PF_hat\r\n");
+    printf("---------------------------------------------------------------------------------------------------------------\r\n");
+    for (size_t i = 0; i < 10 && i < BATCH_M; ++i) {
+        printf("%3u    | %7.3f | %8.3f | %7.3f | %9.3f | %9.3f | %5.3f || %8.3f %8.3f %7.3f %8.3f %8.3f %5.3f\r\n",
+               (unsigned)i+1,
+               (double)raw[i][0], (double)raw[i][1], (double)raw[i][2], (double)raw[i][3], (double)raw[i][4], (double)raw[i][5],
+               (double)Xhat[i][0], (double)Xhat[i][1], (double)Xhat[i][2], (double)Xhat[i][3], (double)Xhat[i][4], (double)Xhat[i][5]);
+    }
+
+    /* ------------------- NEW: spectral sparsify + int16 quantized coefficients on the principal component ------------------ */
+    const float ENERGY_THRESHOLD = 0.90f; /* aggressive (fewer bins) - tweakable */
+    const size_t pc_len = BATCH_M; /* 60 */
+    const size_t MAX_KEEP_BINS = 8; /* cap for safety - tweakable */
+
+    float fft_in_local[FFT_LEN];
+    float fft_packed_orig[FFT_LEN];
+    float fft_packed_sparse[FFT_LEN];
+    float ifft_time[FFT_LEN];
+
+    uint32_t half = FFT_LEN / 2;
+    bin_e_t bins_local[(FFT_LEN / 2) + 1];
+
+    /* We have only KEEP_K==1 component */
+    for (int comp = 0; comp < KEEP_K; ++comp) {
+        /* build input: copy Y_k1[:,comp] into input and zero-pad */
+        for (size_t i = 0; i < FFT_LEN; ++i) {
+            fft_in_local[i] = (i < pc_len) ? Y_k1[i][comp] : 0.0f;
+        }
+
+        fft_forward_packed(fft_in_local, fft_packed_orig);
+
+        /* compute per-bin energies */
+        float total_energy = 0.0f;
+        /* DC */
+        {
+            float re0 = fft_packed_orig[0];
+            float e = re0*re0;
+            bins_local[0].idx = 0; bins_local[0].energy = e;
+            total_energy += e;
+        }
+        for (uint32_t k = 1; k < half; ++k) {
+            float re = fft_packed_orig[2*k];
+            float im = fft_packed_orig[2*k + 1];
+            float e = re*re + im*im;
+            bins_local[k].idx = (uint16_t)k; bins_local[k].energy = e;
+            total_energy += e;
+        }
+        {
+            float reN = fft_packed_orig[1];
+            float e = reN*reN;
+            bins_local[half].idx = (uint16_t)half; bins_local[half].energy = e;
+            total_energy += e;
+        }
+
+        qsort(bins_local, half + 1, sizeof(bin_e_t), cmp_bin_e_desc);
+
+        float cum = 0.0f;
+        size_t keep_count = 0;
+        for (size_t b = 0; b <= half; ++b) {
+            cum += bins_local[b].energy;
+            keep_count++;
+            if ((total_energy > 0.0f && (cum / total_energy) >= ENERGY_THRESHOLD) || (keep_count >= MAX_KEEP_BINS)) break;
+        }
+        if (keep_count == 0) keep_count = 1;
+
+        int dc_found = 0;
+        for (size_t bi = 0; bi < keep_count; ++bi) if (bins_local[bi].idx == 0) { dc_found = 1; break; }
+        if (!dc_found) bins_local[keep_count-1].idx = 0;
+
+        float max_abs = 0.0f;
+        for (size_t bi = 0; bi < keep_count; ++bi) {
+            uint16_t k = bins_local[bi].idx;
+            if (k == 0) {
+                float re0 = fft_packed_orig[0];
+                if (fabsf(re0) > max_abs) max_abs = fabsf(re0);
+            } else if (k == half) {
+                float reN = fft_packed_orig[1];
+                if (fabsf(reN) > max_abs) max_abs = fabsf(reN);
+            } else {
+                float re = fft_packed_orig[2*k];
+                float im = fft_packed_orig[2*k + 1];
+                if (fabsf(re) > max_abs) max_abs = fabsf(re);
+                if (fabsf(im) > max_abs) max_abs = fabsf(im);
+            }
+        }
+        float quant_scale = (max_abs > 0.0f) ? (max_abs / 32767.0f) : 1.0f;
+
+        for (uint32_t i = 0; i < FFT_LEN; ++i) fft_packed_sparse[i] = 0.0f;
+
+        for (size_t bi = 0; bi < keep_count; ++bi) {
+            uint16_t k = bins_local[bi].idx;
+            if (k == 0) {
+                float re0 = fft_packed_orig[0];
+                int16_t q_re = (int16_t)lroundf(re0 / quant_scale);
+                if (q_re > 32767) q_re = 32767;
+                if (q_re < -32768) q_re = -32768;
+                fft_packed_sparse[0] = (float)q_re * quant_scale;
+            } else if (k == half) {
+                float reN = fft_packed_orig[1];
+                int16_t q_re = (int16_t)lroundf(reN / quant_scale);
+                if (q_re > 32767) q_re = 32767;
+                if (q_re < -32768) q_re = -32768;
+                fft_packed_sparse[1] = (float)q_re * quant_scale;
+            } else {
+                float re = fft_packed_orig[2*k];
+                float im = fft_packed_orig[2*k + 1];
+                int16_t q_re = (int16_t)lroundf(re / quant_scale);
+                int16_t q_im = (int16_t)lroundf(im / quant_scale);
+                if (q_re > 32767) q_re = 32767;
+                if (q_re < -32768) q_re = -32768;
+                if (q_im > 32767) q_im = 32767;
+                if (q_im < -32768) q_im = -32768;
+                fft_packed_sparse[2*k]     = (float)q_re * quant_scale;
+                fft_packed_sparse[2*k + 1] = (float)q_im * quant_scale;
+            }
+        }
+
+        fft_inverse_packed(fft_packed_sparse, ifft_time);
+
+        double sse = 0.0;
+        double var = 0.0;
+        double meanOrig = 0.0;
+        for (size_t i = 0; i < pc_len; ++i) meanOrig += (double)Y_k1[i][comp];
+        meanOrig /= (double)pc_len;
+        for (size_t i = 0; i < pc_len; ++i) {
+            double orig = (double)Y_k1[i][comp];
+            double rec  = (double)ifft_time[i];
+            double e = orig - rec;
+            sse += e*e;
+            double dv = orig - meanOrig;
+            var += dv*dv;
+        }
+        float mse_pc = (float)(sse / (double)pc_len);
+        float total_var = (float)(var / (double)pc_len);
+
+        size_t bytes_raw_pc = pc_len * sizeof(float);
+        size_t bytes_compressed_pc = sizeof(float) + sizeof(uint16_t) + sizeof(float) + keep_count * (sizeof(uint8_t) + 2*sizeof(int16_t));
+
+        double saved_percent = 100.0 * (1.0 - ((double)bytes_compressed_pc / (double)bytes_raw_pc));
+
+        if (bytes_compressed_pc >= bytes_raw_pc) {
+            printf("PC %d: kept %u/%u bins -> bytes raw %u compressed %u (NO COMPRESSION BENEFIT) MSE=%g Var=%g Ratio(MSE/Var)=%g\r\n",
+                   comp+1, (unsigned)keep_count, (unsigned)(half+1),
+                   (unsigned)bytes_raw_pc, (unsigned)bytes_compressed_pc,
+                   (double)mse_pc, (double)total_var, (total_var>0.0f ? (double)(mse_pc/total_var) : 0.0));
+        } else {
+            printf("PC %d: kept %u/%u bins -> bytes raw %u compressed %u (%.2f%% saved) MSE=%g Var=%g Ratio(MSE/Var)=%g\r\n",
+                   comp+1, (unsigned)keep_count, (unsigned)(half+1),
+                   (unsigned)bytes_raw_pc, (unsigned)bytes_compressed_pc, saved_percent,
+                   (double)mse_pc, (double)total_var, (total_var>0.0f ? (double)(mse_pc/total_var) : 0.0));
+        }
+
+        printf(" Kept bins:");
+        for (size_t bi = 0; bi < keep_count && bi < 32; ++bi) printf(" %u", (unsigned)bins_local[bi].idx);
+        printf("\r\n");
+    }
+
+    printf("--- End PCA batch ---\r\n");
+}
+
+/* ---------------------------
+   REG LIST & main() (kept intact, minimal edits)
+   --------------------------- */
+static const uint16_t single_phase_regs[] = {
+    3866, 3854, 3848, 3850, 3852, 3840, 3842, 3846, 3898, 3900, 3902
+};
+static const size_t n_single = sizeof(single_phase_regs)/sizeof(single_phase_regs[0]);
+
+int main(void)
+{
+    HAL_Init();
+    SystemClock_Config();
+
+    MX_GPIO_Init();
+    MX_USB_OTG_FS_PCD_Init();
+    MX_USART3_UART_Init(); /* debug */
+    MX_USART2_UART_Init(); /* modbus */
+
+    HAL_GPIO_WritePin(RS485_DE_PORT, RS485_DE_PIN, GPIO_PIN_RESET);
+
+    /* Initialize FFT subsystem (CMSIS RFFT wrapper) */
+    fft_init();
+
+    printf("\r\nSmartmeter single-phase minimal poller (with PCA batch + FFT sparsify)\r\n");
+
+    while (1) {
+        printf("\r\n=== Single-phase / Average / Energy (clean view) ===\r\n");
+
+        for (size_t i = 0; i < n_single; ++i) {
+            uint16_t r = single_phase_regs[i];
+            float f = 0.0f; uint32_t u = 0;
+            int ok = (read_pair_ws(r, &f, &u) == 0);
+
+            /* For power-related regs (3840,3842,3846) use verbose reader for extra diagnostics */
+            if (r == 3840 || r == 3842 || r == 3846) {
+                float fv = 0.0f;
+                uint32_t uv = 0;
+                int rv = read_pair_ws_verbose(r, &fv, &uv);
+
+                /* we still print the normal style but add raw-u32 */
+                if (rv == 0) {
+                    if (r == 3840) {
+                        printf("Apparent Power (reg%u): %7.3f VA   (raw u32=0x%08lX)\r\n",
+                               r, (double)fv, (unsigned long)uv);
+                        if (fv == 0.0f)
+                            printf("  NOTE: Apparent power float==0. Check register map/config.\r\n");
+                        if (uv == 0) debug_read_reg_interpret(r);
+                    }
+                    else if (r == 3842) {
+                        printf("Active Power (reg%u):   %7.3f W    (raw u32=0x%08lX)\r\n",
+                               r, (double)fv, (unsigned long)uv);
+                        if (fv == 0.0f)
+                            printf("  NOTE: Active power float==0. Check register map/config.\r\n");
+                    }
+                    else if (r == 3846) {
+                        printf("Power Factor (reg%u):   %7.3f    (raw u32=0x%08lX)\r\n",
+                               r, (double)fv, (unsigned long)uv);
+                        if (fv == 0.0f)
+                            printf("  NOTE: Power factor float==0. Check register map/config.\r\n");
+                    }
+                } else {
+                    if (r == 3840)
+                        printf("Apparent Power (reg%u): read fail (rc=%d)\r\n", r, rv);
+                    else if (r == 3842)
+                        printf("Active Power (reg%u): read fail (rc=%d)\r\n", r, rv);
+                    else if (r == 3846)
+                        printf("Power Factor (reg%u): read fail (rc=%d)\r\n", r, rv);
+                }
+
+                HAL_Delay(30);
+                continue;
+            }
+
+            /* existing prints for other regs (current/voltage/freq etc) */
+            if (r == 3866) {
+                if (ok) printf("R-phase Voltage (reg%u): %7.3f V   (raw u32=%lu)\r\n", r, (double)f, (unsigned long)u);
+                else    printf("R-phase Voltage (reg%u): read fail\r\n", r);
+            } else if (r == 3854) {
+                if (ok) printf("Frequency (reg%u):      %7.3f Hz  (raw u32=%lu)\r\n", r, (double)f, (unsigned long)u);
+                else    printf("Frequency (reg%u): read fail\r\n", r);
+            } else if (r == 3848) {
+                if (ok) printf("Line-to-Line (reg%u):   %7.3f  (diag ×1.5 => %7.3f V)\r\n", r, (double)f, (double)(f*1.5f));
+                else    printf("Line-to-Line (reg%u): read fail\r\n", r);
+            } else if (r == 3850) {
+                if (ok) printf("Line-to-Neutral (reg%u):%7.3f  (diag ×3.0 => %7.3f V)\r\n", r, (double)f, (double)(f*3.0f));
+                else    printf("Line-to-Neutral (reg%u): read fail\r\n", r);
+            } else if (r == 3852) {
+                if (ok) printf("Avg Current (reg%u):    %7.3f A\r\n", r, (double)f);
+                else    printf("Avg Current (reg%u): read fail\r\n", r);
+            } else {
+                if (ok) {
+                    uint16_t w0 = ((uint16_t)(u & 0xFFFF));
+                    uint16_t w1 = (uint16_t)(u >> 16);
+                    printf("Reg %u : words 0x%04X 0x%04X -> float: %f, u32: %lu\r\n",
+                           (unsigned)r, (unsigned)w0, (unsigned)w1, (double)f, (unsigned long)u);
+                } else {
+                    printf("Reg %u : read fail\r\n", (unsigned)r);
+                }
+            }
+
+            HAL_Delay(60);
+        }
+
+        printf("\r\n--- End sweep ---\r\n");
+
+        /* run PCA batch collection (60 samples at 1 Hz) and print summary */
+        run_pca_batch();
+
+        HAL_Delay(SWEEP_DELAY_MS);
+    }
+}
+
+/* Use your project's SystemClock_Config() and Error_Handler() as before. */
+void SystemClock_Config(void)
+{
+  RCC_OscInitTypeDef RCC_OscInitStruct = {0};
+  RCC_ClkInitTypeDef RCC_ClkInitStruct = {0};
+
+  __HAL_RCC_PWR_CLK_ENABLE();
+  __HAL_PWR_VOLTAGESCALING_CONFIG(PWR_REGULATOR_VOLTAGE_SCALE1);
+
+  RCC_OscInitStruct.OscillatorType = RCC_OSCILLATORTYPE_HSE;
+  RCC_OscInitStruct.HSEState = RCC_HSE_BYPASS;
+  RCC_OscInitStruct.PLL.PLLState = RCC_PLL_ON;
+  RCC_OscInitStruct.PLL.PLLSource = RCC_PLLSOURCE_HSE;
+  RCC_OscInitStruct.PLL.PLLM = 8;
+  RCC_OscInitStruct.PLL.PLLN = 384;
+  RCC_OscInitStruct.PLL.PLLP = RCC_PLLP_DIV4;
+  RCC_OscInitStruct.PLL.PLLQ = 8;
+  RCC_OscInitStruct.PLL.PLLR = 2;
+  if (HAL_RCC_OscConfig(&RCC_OscInitStruct) != HAL_OK) { Error_Handler(); }
+
+  RCC_ClkInitStruct.ClockType = RCC_CLOCKTYPE_HCLK|RCC_CLOCKTYPE_SYSCLK
+                              |RCC_CLOCKTYPE_PCLK1|RCC_CLOCKTYPE_PCLK2;
+  RCC_ClkInitStruct.SYSCLKSource = RCC_SYSCLKSOURCE_PLLCLK;
+  RCC_ClkInitStruct.AHBCLKDivider = RCC_SYSCLK_DIV1;
+  RCC_ClkInitStruct.APB1CLKDivider = RCC_HCLK_DIV2;
+  RCC_ClkInitStruct.APB2CLKDivider = RCC_HCLK_DIV1;
+
+  if (HAL_RCC_ClockConfig(&RCC_ClkInitStruct, FLASH_LATENCY_3) != HAL_OK) { Error_Handler(); }
+}
+
+void Error_Handler(void)
+{
+  __disable_irq();
+  while (1) { }
+}
+
+#ifdef  USE_FULL_ASSERT
+void assert_failed(uint8_t *file, uint32_t line)
+{
+  /* Optionally print file/line for parameter errors */
+}
+#endif
