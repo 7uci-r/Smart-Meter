@@ -1,0 +1,284 @@
+/**
+  ******************************************************************************
+  * @file    main.c
+  * @brief   Smart-meter UART reader (USART2 RX -> parse -> debug on USART3)
+  ******************************************************************************
+  */
+
+#include "main.h"
+#include <stdio.h>
+#include <string.h>
+#include <stdint.h>
+
+/* Private defines -----------------------------------------------------------*/
+#define PACKET_LEN     40U
+#define UART_RX_TIMEOUT_MS 3000U
+
+/* Private variables ---------------------------------------------------------*/
+UART_HandleTypeDef huart2; // meter UART (RX)
+UART_HandleTypeDef huart3; // debug UART (TX)
+uint8_t rx_buffer[PACKET_LEN];
+
+/* Private function prototypes -----------------------------------------------*/
+void SystemClock_Config(void);
+static void MX_GPIO_Init(void);
+static void MX_USART2_UART_Init(void);
+static void MX_USART3_UART_Init(void);
+void Error_Handler(void);
+
+/* Retarget printf to huart3 for debug output */
+int __io_putchar(int ch)
+{
+    uint8_t c = (uint8_t)ch;
+    HAL_UART_Transmit(&huart3, &c, 1, HAL_MAX_DELAY);
+    return ch;
+}
+
+/* CRC8 (MSB-first, poly 0x07) - same algorithm as your Linux code */
+uint8_t crc8(const uint8_t *data, size_t len)
+{
+    uint8_t crc = 0x00;
+    for (size_t i = 0; i < len; ++i) {
+        crc ^= data[i];
+        for (uint8_t j = 0; j < 8; ++j) {
+            if (crc & 0x80) crc = (crc << 1) ^ 0x07;
+            else crc <<= 1;
+        }
+    }
+    return crc;
+}
+
+/* Pack bytes big-endian into unsigned 32-bit */
+uint32_t PackDataBE(const uint8_t *arr, uint8_t length)
+{
+    uint32_t val = 0;
+    for (uint8_t i = 0; i < length; ++i) {
+        val = (val << 8) | (uint32_t)arr[i];
+    }
+    return val;
+}
+
+/* Hex dump helper (prints to huart3) */
+void hex_dump(const uint8_t *buf, size_t len)
+{
+    for (size_t i = 0; i < len; ++i) {
+        printf("%02X ", buf[i]);
+        if ((i & 15) == 15) printf("\r\n");
+    }
+    printf("\r\n");
+}
+
+/* Decode and print parsed values (raw integers; apply scaling later if needed) */
+void decode_and_print(const uint8_t *buf)
+{
+    uint32_t voltage        = PackDataBE(&buf[0], 4);
+    uint32_t current        = PackDataBE(&buf[4], 4);
+    uint32_t real_power     = PackDataBE(&buf[8], 4);
+    uint32_t reactive_power = PackDataBE(&buf[12],4);
+    uint32_t apparent_power = PackDataBE(&buf[16],4);
+    uint16_t inst_pf        = (uint16_t)PackDataBE(&buf[20], 2);
+    uint8_t  pf_sign        = buf[22];
+    uint16_t inst_freq      = (uint16_t)PackDataBE(&buf[23], 2);
+    uint32_t real_kwh       = PackDataBE(&buf[25], 4);
+    uint32_t real_kvah      = PackDataBE(&buf[29], 4);
+
+    uint8_t Date = buf[33];
+    uint8_t Month = buf[34];
+    uint8_t Year = buf[35];
+    uint8_t Hour = buf[36];
+    uint8_t Min = buf[37];
+    uint8_t Sec = buf[38];
+
+    printf("----- Parsed Values -----\r\n");
+    printf("Voltage        : %lu\r\n", (unsigned long)voltage);
+    printf("Current        : %lu\r\n", (unsigned long)current);
+    printf("Real Power     : %lu\r\n", (unsigned long)real_power);
+    printf("Reactive Power : %lu\r\n", (unsigned long)reactive_power);
+    printf("Apparent Power : %lu\r\n", (unsigned long)apparent_power);
+    printf("InstPF         : %u\r\n", (unsigned int)inst_pf);
+    printf("PFSign         : %u\r\n", (unsigned int)pf_sign);
+    printf("Frequency      : %u\r\n", (unsigned int)inst_freq);
+    printf("Real KWH       : %lu\r\n", (unsigned long)real_kwh);
+    printf("Real KVAH      : %lu\r\n", (unsigned long)real_kvah);
+    printf("RTC            : %02u/%02u/%02u  %02u:%02u:%02u\r\n",
+           Date, Month, Year, Hour, Min, Sec);
+    printf("--------------------------\r\n\r\n");
+}
+
+/* Application entry point */
+int main(void)
+{
+    HAL_Init();
+    SystemClock_Config();
+
+    MX_GPIO_Init();
+    MX_USART3_UART_Init(); // debug first so printf works early
+    MX_USART2_UART_Init(); // meter UART
+
+    printf("\r\n=== Smart Meter UART Reader (STM32F4) ===\r\n");
+    printf("USART2: 38400 baud (RX)  |  USART3: 115200 baud (debug)\r\n");
+    printf("Expecting %u-byte frames. Timeout per frame: %u ms\r\n\r\n", (unsigned)PACKET_LEN, (unsigned)UART_RX_TIMEOUT_MS);
+
+    while (1)
+    {
+        /* Blocking receive PACKET_LEN bytes with timeout */
+        HAL_StatusTypeDef r = HAL_UART_Receive(&huart2, rx_buffer, PACKET_LEN, UART_RX_TIMEOUT_MS);
+        if (r == HAL_OK)
+        {
+            printf("[INFO] Received %u bytes. Dump:\r\n", (unsigned)PACKET_LEN);
+            hex_dump(rx_buffer, PACKET_LEN);
+
+            uint8_t computed = crc8(rx_buffer, PACKET_LEN - 1);
+            uint8_t received = rx_buffer[PACKET_LEN - 1];
+
+            if (computed == received)
+            {
+                printf("[INFO] CRC OK (0x%02X)\r\n", computed);
+                decode_and_print(rx_buffer);
+            }
+            else
+            {
+                printf("[ERROR] CRC mismatch. Computed=0x%02X Received=0x%02X\r\n", computed, received);
+                printf("[DEBUG] Dump of frame with CRC:\r\n");
+                hex_dump(rx_buffer, PACKET_LEN);
+            }
+        }
+        else if (r == HAL_TIMEOUT)
+        {
+            printf("[WARN] UART receive timeout (%u ms). No full packet.\r\n", (unsigned)UART_RX_TIMEOUT_MS);
+        }
+        else
+        {
+            printf("[ERROR] HAL_UART_Receive returned %d\r\n", (int)r);
+            /* optional: try re-initializing UART or handle error */
+            HAL_Delay(500);
+        }
+
+        /* small delay to avoid spamming if meter is continuous */
+        HAL_Delay(50);
+    }
+}
+
+/* -------------------------------------------------------------------------- */
+/* Peripherals init functions                                                  */
+/* -------------------------------------------------------------------------- */
+
+/**
+  * System Clock Configuration
+  * (Kept compact and functional; adjust if your board needs different config)
+  */
+void SystemClock_Config(void)
+{
+    RCC_OscInitTypeDef RCC_OscInitStruct = {0};
+    RCC_ClkInitTypeDef RCC_ClkInitStruct = {0};
+
+    __HAL_RCC_PWR_CLK_ENABLE();
+    __HAL_PWR_VOLTAGESCALING_CONFIG(PWR_REGULATOR_VOLTAGE_SCALE1);
+
+    RCC_OscInitStruct.OscillatorType = RCC_OSCILLATORTYPE_HSE;
+    RCC_OscInitStruct.HSEState       = RCC_HSE_BYPASS;
+    RCC_OscInitStruct.PLL.PLLState   = RCC_PLL_ON;
+    RCC_OscInitStruct.PLL.PLLSource  = RCC_PLLSOURCE_HSE;
+    RCC_OscInitStruct.PLL.PLLM       = 8;
+    RCC_OscInitStruct.PLL.PLLN       = 384;
+    RCC_OscInitStruct.PLL.PLLP       = RCC_PLLP_DIV4;
+    RCC_OscInitStruct.PLL.PLLQ       = 8;
+    RCC_OscInitStruct.PLL.PLLR       = 2;
+    if (HAL_RCC_OscConfig(&RCC_OscInitStruct) != HAL_OK) Error_Handler();
+
+    RCC_ClkInitStruct.ClockType      = RCC_CLOCKTYPE_HCLK|RCC_CLOCKTYPE_SYSCLK
+                                     |RCC_CLOCKTYPE_PCLK1|RCC_CLOCKTYPE_PCLK2;
+    RCC_ClkInitStruct.SYSCLKSource   = RCC_SYSCLKSOURCE_PLLCLK;
+    RCC_ClkInitStruct.AHBCLKDivider  = RCC_SYSCLK_DIV1;
+    RCC_ClkInitStruct.APB1CLKDivider = RCC_HCLK_DIV2;
+    RCC_ClkInitStruct.APB2CLKDivider = RCC_HCLK_DIV1;
+    if (HAL_RCC_ClockConfig(&RCC_ClkInitStruct, FLASH_LATENCY_3) != HAL_OK) Error_Handler();
+}
+
+/**
+  * MX_USART2_UART_Init
+  * USART2: PA2=TX (not used), PA3=RX <- meter TX connects here
+  */
+static void MX_USART2_UART_Init(void)
+{
+    __HAL_RCC_USART2_CLK_ENABLE();
+
+    huart2.Instance = USART2;
+    huart2.Init.BaudRate = 38400;
+    huart2.Init.WordLength = UART_WORDLENGTH_8B;
+    huart2.Init.StopBits = UART_STOPBITS_1;
+    huart2.Init.Parity = UART_PARITY_NONE;
+    huart2.Init.Mode = UART_MODE_RX;
+    huart2.Init.HwFlowCtl = UART_HWCONTROL_NONE;
+    huart2.Init.OverSampling = UART_OVERSAMPLING_16;
+
+    if (HAL_UART_Init(&huart2) != HAL_OK) Error_Handler();
+}
+
+/**
+  * MX_USART3_UART_Init
+  * USART3: PC10=TX -> debug to PC (Putty)
+  */
+static void MX_USART3_UART_Init(void)
+{
+    __HAL_RCC_USART3_CLK_ENABLE();
+
+    huart3.Instance = USART3;
+    huart3.Init.BaudRate = 115200;
+    huart3.Init.WordLength = UART_WORDLENGTH_8B;
+    huart3.Init.StopBits = UART_STOPBITS_1;
+    huart3.Init.Parity = UART_PARITY_NONE;
+    huart3.Init.Mode = UART_MODE_TX;
+    huart3.Init.HwFlowCtl = UART_HWCONTROL_NONE;
+    huart3.Init.OverSampling = UART_OVERSAMPLING_16;
+
+    if (HAL_UART_Init(&huart3) != HAL_OK) Error_Handler();
+}
+
+/**
+  * MX_GPIO_Init
+  * Configures UART AF pins and a small status LED on PB0
+  */
+static void MX_GPIO_Init(void)
+{
+    GPIO_InitTypeDef GPIO_InitStruct = {0};
+
+    /* GPIO clocks */
+    __HAL_RCC_GPIOA_CLK_ENABLE();
+    __HAL_RCC_GPIOC_CLK_ENABLE();
+    __HAL_RCC_GPIOB_CLK_ENABLE();
+
+    /* USART2 pins: PA2 (TX), PA3 (RX) */
+    GPIO_InitStruct.Pin = GPIO_PIN_2 | GPIO_PIN_3;
+    GPIO_InitStruct.Mode = GPIO_MODE_AF_PP;
+    GPIO_InitStruct.Pull = GPIO_NOPULL;
+    GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_VERY_HIGH;
+    GPIO_InitStruct.Alternate = GPIO_AF7_USART2;
+    HAL_GPIO_Init(GPIOA, &GPIO_InitStruct);
+
+    /* USART3 pins: PC10 (TX), PC11 (RX not used) */
+    GPIO_InitStruct.Pin = GPIO_PIN_10 | GPIO_PIN_11;
+    GPIO_InitStruct.Alternate = GPIO_AF7_USART3;
+    HAL_GPIO_Init(GPIOC, &GPIO_InitStruct);
+
+    /* Simple status LED on PB0 */
+    GPIO_InitStruct.Pin = GPIO_PIN_0;
+    GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
+    GPIO_InitStruct.Pull = GPIO_NOPULL;
+    GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
+    HAL_GPIO_Init(GPIOB, &GPIO_InitStruct);
+    HAL_GPIO_WritePin(GPIOB, GPIO_PIN_0, GPIO_PIN_RESET);
+}
+
+/**
+  * Error_Handler
+  */
+void Error_Handler(void)
+{
+    __disable_irq();
+    while (1)
+    {
+        HAL_GPIO_TogglePin(GPIOB, GPIO_PIN_0);
+        HAL_Delay(250);
+    }
+}
