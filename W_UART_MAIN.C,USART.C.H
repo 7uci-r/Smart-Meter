@@ -283,3 +283,186 @@ void Error_Handler(void)
   __disable_irq();
   while (1) { }
 }
+
+
+/* USER CODE BEGIN Header */
+/**
+  ******************************************************************************
+  * @file    usart.c
+  * @brief   This file provides code for the configuration
+  *          of the USART instances and the RX DMA buffer definition.
+  ******************************************************************************
+  */
+/* USER CODE END Header */
+
+#include "main.h"    /* for Error_Handler prototype and HAL includes */
+#include "usart.h"
+
+/* Define the RX DMA buffer here exactly once (volatile since DMA writes). */
+volatile uint8_t rx_dma_buf[RX_DMA_BUF_LEN];
+
+/* HAL handles (definition here, declared extern in usart.h) */
+UART_HandleTypeDef huart2;
+UART_HandleTypeDef huart3;
+DMA_HandleTypeDef hdma_usart2_rx;
+
+/* USART2 init function (meter input) */
+void MX_USART2_UART_Init(void)
+{
+  huart2.Instance = USART2;
+  huart2.Init.BaudRate = 38400; /* meter baud as you specified */
+  huart2.Init.WordLength = UART_WORDLENGTH_8B;
+  huart2.Init.StopBits = UART_STOPBITS_1;
+  huart2.Init.Parity = UART_PARITY_NONE;
+  huart2.Init.Mode = UART_MODE_TX_RX;
+  huart2.Init.HwFlowCtl = UART_HWCONTROL_NONE;
+  huart2.Init.OverSampling = UART_OVERSAMPLING_16;
+  if (HAL_UART_Init(&huart2) != HAL_OK)
+  {
+    Error_Handler();
+  }
+}
+
+/* USART3 init function (debug -> USB-UART to PC) */
+void MX_USART3_UART_Init(void)
+{
+  huart3.Instance = USART3;
+  huart3.Init.BaudRate = 115200; /* debug/putty */
+  huart3.Init.WordLength = UART_WORDLENGTH_8B;
+  huart3.Init.StopBits = UART_STOPBITS_1;
+  huart3.Init.Parity = UART_PARITY_NONE;
+  huart3.Init.Mode = UART_MODE_TX_RX;
+  huart3.Init.HwFlowCtl = UART_HWCONTROL_NONE;
+  huart3.Init.OverSampling = UART_OVERSAMPLING_16;
+  if (HAL_UART_Init(&huart3) != HAL_OK)
+  {
+    Error_Handler();
+  }
+}
+
+/* MSP init: configure GPIOs, DMA and NVIC for both UARTs */
+void HAL_UART_MspInit(UART_HandleTypeDef* uartHandle)
+{
+  GPIO_InitTypeDef GPIO_InitStruct = {0};
+
+  if(uartHandle->Instance==USART2)
+  {
+    /* USART2 clock enable */
+    __HAL_RCC_USART2_CLK_ENABLE();
+
+    /* GPIOA clock for PA2(TX) PA3(RX) */
+    __HAL_RCC_GPIOA_CLK_ENABLE();
+    /**USART2 GPIO Configuration
+        PA2 -> USART2_TX
+        PA3 -> USART2_RX
+    */
+    GPIO_InitStruct.Pin = GPIO_PIN_2|GPIO_PIN_3;
+    GPIO_InitStruct.Mode = GPIO_MODE_AF_PP;
+    GPIO_InitStruct.Pull = GPIO_NOPULL;
+    GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_VERY_HIGH;
+    GPIO_InitStruct.Alternate = GPIO_AF7_USART2;
+    HAL_GPIO_Init(GPIOA, &GPIO_InitStruct);
+
+    /* USART2 DMA Init - RX */
+    __HAL_RCC_DMA1_CLK_ENABLE();
+    hdma_usart2_rx.Instance = DMA1_Stream5;
+    hdma_usart2_rx.Init.Channel = DMA_CHANNEL_4;
+    hdma_usart2_rx.Init.Direction = DMA_PERIPH_TO_MEMORY;
+    hdma_usart2_rx.Init.PeriphInc = DMA_PINC_DISABLE;
+    hdma_usart2_rx.Init.MemInc = DMA_MINC_ENABLE;
+    hdma_usart2_rx.Init.PeriphDataAlignment = DMA_PDATAALIGN_BYTE;
+    hdma_usart2_rx.Init.MemDataAlignment = DMA_MDATAALIGN_BYTE;
+    hdma_usart2_rx.Init.Mode = DMA_CIRCULAR;
+    hdma_usart2_rx.Init.Priority = DMA_PRIORITY_MEDIUM;
+    hdma_usart2_rx.Init.FIFOMode = DMA_FIFOMODE_DISABLE;
+    if (HAL_DMA_Init(&hdma_usart2_rx) != HAL_OK)
+    {
+      Error_Handler();
+    }
+
+    /* Link DMA handle to UART handle */
+    __HAL_LINKDMA(uartHandle, hdmarx, hdma_usart2_rx);
+
+    /* Optional: if you want USART2 IRQ */
+    HAL_NVIC_SetPriority(USART2_IRQn, 0, 0);
+    HAL_NVIC_EnableIRQ(USART2_IRQn);
+    /* DMA IRQ (stream5) enabled in MX_DMA_Init usually */
+  }
+  else if(uartHandle->Instance==USART3)
+  {
+    /* USART3 clock enable */
+    __HAL_RCC_USART3_CLK_ENABLE();
+
+    /* GPIOD clock for PD8(TX) PD9(RX) */
+    __HAL_RCC_GPIOD_CLK_ENABLE();
+    /**USART3 GPIO Configuration
+        PD8 -> USART3_TX
+        PD9 -> USART3_RX
+    */
+    GPIO_InitStruct.Pin = GPIO_PIN_8|GPIO_PIN_9;
+    GPIO_InitStruct.Mode = GPIO_MODE_AF_PP;
+    GPIO_InitStruct.Pull = GPIO_NOPULL;
+    GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_VERY_HIGH;
+    GPIO_InitStruct.Alternate = GPIO_AF7_USART3;
+    HAL_GPIO_Init(GPIOD, &GPIO_InitStruct);
+  }
+}
+
+void HAL_UART_MspDeInit(UART_HandleTypeDef* uartHandle)
+{
+  if(uartHandle->Instance==USART2)
+  {
+    __HAL_RCC_USART2_CLK_DISABLE();
+    HAL_GPIO_DeInit(GPIOA, GPIO_PIN_2|GPIO_PIN_3);
+    HAL_DMA_DeInit(uartHandle->hdmarx);
+    HAL_NVIC_DisableIRQ(USART2_IRQn);
+  }
+  else if(uartHandle->Instance==USART3)
+  {
+    __HAL_RCC_USART3_CLK_DISABLE();
+    HAL_GPIO_DeInit(GPIOD, GPIO_PIN_8|GPIO_PIN_9);
+  }
+}
+
+
+
+/* USER CODE BEGIN Header */
+/**
+  ******************************************************************************
+  * @file    usart.h
+  * @brief   This file contains all the function prototypes for
+  *          the USART peripherals and the shared RX DMA buffer.
+  ******************************************************************************
+  */
+/* USER CODE END Header */
+#ifndef __USART_H__
+#define __USART_H__
+
+#ifdef __cplusplus
+extern "C" {
+#endif
+
+#include "stm32f4xx_hal.h"
+
+/* RX DMA buffer size (used by main.c parser) */
+#ifndef RX_DMA_BUF_LEN
+#define RX_DMA_BUF_LEN 128
+#endif
+
+/* Exposed UART handles (definition in usart.c) */
+extern UART_HandleTypeDef huart2;
+extern UART_HandleTypeDef huart3;
+extern DMA_HandleTypeDef hdma_usart2_rx;
+
+/* RX DMA buffer: defined in usart.c, extern here for other modules */
+extern volatile uint8_t rx_dma_buf[RX_DMA_BUF_LEN];
+
+/* Init functions */
+void MX_USART2_UART_Init(void);
+void MX_USART3_UART_Init(void);
+
+#ifdef __cplusplus
+}
+#endif
+
+#endif /* __USART_H__ */
